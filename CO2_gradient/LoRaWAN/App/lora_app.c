@@ -47,7 +47,7 @@
 #include "ff.h"
 #include "sd_logger.h"
 #include "onewire.h"
-
+#include "timer_if.h"
 #include "main.h"
 #include "i2c.h"
 #include "spi.h"
@@ -83,17 +83,11 @@ uint8_t readings = 30;
 uint16_t buf_co2[100];
 uint16_t avg_co2 = 0;
 uint8_t i = 0;
-//uint8_t buf_uart[12];
-//uint8_t TxBufferMode[5]="K 2\r\n";
-//uint8_t TxBufferModeone[5]="K 1\r\n";
-//uint8_t TxBufferModezero[5]="K 0\r\n";
 uint8_t TxBufferFilteredReading[3]="Z\r\n";
-//uint8_t RxBuffermode[9] = {0};
 uint8_t RdBuffer[BUFFSIZE];    // Buffer circolare per dati dal sensore
 uint8_t RdPCBuffer[BUFFSIZE];  // Buffer lineare per comandi dal PC
 uint16_t InS = 0, PCPtr = 0;
 uint8_t data[] = "Received\r\n";
-//uint8_t dataerr[] = "Error\r\n";
 uint8_t mode;
 char out[80];
 char outm[80];
@@ -575,9 +569,18 @@ static void LogToSDCard(void)
     // 6) Ora mount
     char logBuffer[256];
     int pos = 0;
+    uint16_t mSeconds;
+    uint32_t totalSeconds;
+    char uartBuf[50];
+
+    totalSeconds = TIMER_IF_GetTime(&mSeconds);
 
     // Aggiungiamo il timestamp iniziale
-    pos += snprintf(logBuffer + pos, sizeof(logBuffer) - pos, "%lu", HAL_GetTick() / 1000);
+    pos += snprintf(logBuffer + pos, sizeof(logBuffer) - pos, "%lu", totalSeconds);
+
+    // Formattiamo la stringa: il %lu serve per i numeri "long unsigned" (32 bit)
+    int len = snprintf(uartBuf, sizeof(uartBuf), "Timestamp RTC: %lu.%03u s\r\n", totalSeconds, mSeconds);
+    HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, len, 100);
 
     // Cicliamo su AppDataBuffer a passi di 2 (dato che ogni valore è uint16_t)
     for (uint8_t j = 0; j + 1 < buffer_index; j += 2)
@@ -985,56 +988,84 @@ void commUsart1(void)
 
 void commUsart2(void)
 {
-	 HAL_UART_Receive_IT(&huart2, rx_buff, 1);
-	 RdPCBuffer[PCPtr] = rx_buff[0];
-	 //HAL_UART_Transmit(&huart2, (uint8_t*)"rec2\r\n", 6, 100);
+    HAL_UART_Receive_IT(&huart2, rx_buff, 1);
+    RdPCBuffer[PCPtr] = rx_buff[0];
 
-	 if (RdPCBuffer[PCPtr] == 'c'){
-	   if (selection == 1){
-		   selection = 2;
-		   HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted automatic mode\r\n", 24, 100);
-		   UTIL_TIMER_Start(&TxTimer);
-	   }
-	   else{
-		   selection = 1;
-		   HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted manual mode\r\n", 21, 100);
-	   }
+    // Command 'c' to toggle between Manual and Automatic mode
+    if (RdPCBuffer[PCPtr] == 'c') {
+        if (selection == 1) {
+            selection = 2;
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted automatic mode\r\n", 24, 100);
+            UTIL_TIMER_Start(&TxTimer);
+        } else {
+            selection = 1;
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted manual mode\r\n", 21, 100);
+        }
+        PCPtr = 0;
+        return;
+    }
 
-	   PCPtr = 0;
-	   return;
-	 }
+    // Command 'l' to toggle LoRa/UART transmission
+    if (RdPCBuffer[PCPtr] == 'l') {
+        lora = !lora;
+        if (lora) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted LoRaWAN transmission mode\r\n", 36, 100);
+        } else {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted UART transmission mode\r\n", 33, 100);
+        }
+        PCPtr = 0;
+        return;
+    }
 
-	 if (RdPCBuffer[PCPtr] == 'l'){
-	 	lora = !lora;
-		if (lora){
-			//LoRaWAN_Init();
-			HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted LoRaWAN transmission mode\r\n", 36, 100);
-		}
-	 	else HAL_UART_Transmit(&huart2, (uint8_t*)"Inserted UART transmission mode\r\n", 33, 100);
-	 	PCPtr = 0;
-	 	return;
-	 }
+    // New Command 'q' to cycle through CO2 sensors in Manual Mode
+    if (RdPCBuffer[PCPtr] == 'q') {
+        // Ensure the MUX is enabled
+        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
 
-	 if (RdPCBuffer[PCPtr++] == '\n' || PCPtr == BUFFSIZE){
-	   if (RdPCBuffer[0] == 't'){
-	     period = atoi((char*)RdPCBuffer + 1);
-	     OnTxPeriodicityChanged(period*1000);
-	     len = sprintf(out, "Periodicity set to %lu ms\r\n", TxPeriodicity);
-	     HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
-	   }
+        // Increment and wrap around (1 -> 2 -> 3 -> 1)
+        sensornum = (sensornum % 3) + 1;
 
-	   else if (RdPCBuffer[0] == 'n'){
-	     readings = atoi((char*)RdPCBuffer + 1);
-	     len = sprintf(out, "Now you will read %d data every cycle\r\n", readings);
-	     HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
-	   }
+        // Apply MUX mapping based on your bitmap:
+        // CO2_1: A2=0, A1=0, A0=1
+        // CO2_2: A2=0, A1=1, A0=1
+        // CO2_3: A2=0, A1=0, A0=0
+        if (sensornum == 1) {
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        } else if (sensornum == 2) {
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        } else { // sensornum == 3
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        }
 
-	   else HAL_UART_Transmit(&huart1, RdPCBuffer, PCPtr, 100);
+        len = sprintf(out, "Manual selection: CO2 Sensor %d active\r\n", sensornum);
+        HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
 
+        PCPtr = 0;
+        return;
+    }
 
-
-	   PCPtr = 0;
-	 }
+    // Handling multi-character commands ending in '\n'
+    if (RdPCBuffer[PCPtr++] == '\n' || PCPtr == BUFFSIZE) {
+        if (RdPCBuffer[0] == 't') {
+            period = atoi((char*)RdPCBuffer + 1);
+            OnTxPeriodicityChanged(period * 1000);
+            len = sprintf(out, "Periodicity set to %lu ms\r\n", TxPeriodicity);
+            HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+        } else if (RdPCBuffer[0] == 'n') {
+            readings = atoi((char*)RdPCBuffer + 1);
+            len = sprintf(out, "Now you will read %d data every cycle\r\n", readings);
+            HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+        } else {
+            HAL_UART_Transmit(&huart1, RdPCBuffer, PCPtr, 100);
+        }
+        PCPtr = 0;
+    }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)

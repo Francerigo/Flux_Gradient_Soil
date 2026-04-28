@@ -2,11 +2,11 @@
 #include "main.h"
 #include "sys_app.h"
 
-// Привязываем hspi1
+// Linking hspi1
 extern SPI_HandleTypeDef hspi1;
 #define HSPI_SDCARD hspi1
 
-// --- КОМАНДЫ SD-КАРТЫ ---
+// --- SD CARD COMMANDS ---
 #define CMD0    (0x40+0)
 #define CMD1    (0x40+1)
 #define CMD8    (0x40+8)
@@ -19,9 +19,9 @@ extern SPI_HandleTypeDef hspi1;
 static volatile DSTATUS Stat = STA_NOINIT;
 static uint8_t CardType;
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ SPI ---
+// --- SPI HELPER FUNCTIONS ---
 
-// Надежная функция: читает байт, обязательно отправляя 0xFF
+// Reliable function: reads a byte, ensuring 0xFF is sent
 static uint8_t SPI_RxByte(void) {
     uint8_t dummy = 0xFF, data = 0xFF;
     HAL_SPI_TransmitReceive(&HSPI_SDCARD, &dummy, &data, 1, 10);
@@ -48,14 +48,14 @@ static uint8_t SD_SendCmd(uint8_t cmd, uint32_t arg) {
 
     if (cmd != CMD0 && SD_ReadyWait() != 0xFF) return 0xFF;
 
-    // Отправляем команду
+    // Send command
     uint8_t cmd_packet[6];
     cmd_packet[0] = cmd;
     cmd_packet[1] = (uint8_t)(arg >> 24);
     cmd_packet[2] = (uint8_t)(arg >> 16);
     cmd_packet[3] = (uint8_t)(arg >> 8);
     cmd_packet[4] = (uint8_t)arg;
-    cmd_packet[5] = 0x01; // CRC по умолчанию
+    cmd_packet[5] = 0x01; // Default CRC
     if (cmd == CMD0) cmd_packet[5] = 0x95;
     if (cmd == CMD8) cmd_packet[5] = 0x87;
 
@@ -72,7 +72,7 @@ static uint8_t SD_SendCmd(uint8_t cmd, uint32_t arg) {
     return res;
 }
 
-// --- ОСНОВНЫЕ ФУНКЦИИ ДРАЙВЕРА ---
+// --- MAIN DRIVER FUNCTIONS ---
 
 DSTATUS SD_disk_initialize(BYTE pdrv) {
     uint8_t n, ocr[4];
@@ -86,12 +86,12 @@ DSTATUS SD_disk_initialize(BYTE pdrv) {
     CS_SD_HIGH();
     HAL_Delay(150);
 
-    for (n = 0; n < 10; n++) SPI_RxByte(); // Протряска 0xFF
+    for (n = 0; n < 10; n++) SPI_RxByte(); // Clocking 0xFF (dummy clocks)
 
     CS_SD_LOW();
 
     uint8_t cmd0_res = SD_SendCmd(CMD0, 0);
-    APP_LOG(TS_ON, VLEVEL_L, "DEBUG: CMD0 = 0x%02X\r\n", cmd0_res);
+    //APP_LOG(TS_ON, VLEVEL_L, "DEBUG: CMD0 = 0x%02X\r\n", cmd0_res);
 
     if (cmd0_res == 1) {
         timeout = HAL_GetTick() + 1000;
@@ -122,9 +122,9 @@ DSTATUS SD_disk_initialize(BYTE pdrv) {
 
     if (CardType) {
         Stat &= ~STA_NOINIT;
-        APP_LOG(TS_ON, VLEVEL_L, "DEBUG: Init OK. Type = %d\r\n", CardType);
+        APP_LOG(TS_ON, VLEVEL_L, "Init OK. Type = %d\r\n", CardType);
     } else {
-        APP_LOG(TS_ON, VLEVEL_L, "DEBUG: Init FAILED!\r\n");
+        APP_LOG(TS_ON, VLEVEL_L, "Init FAILED!\r\n");
     }
 
     return Stat;
@@ -155,14 +155,14 @@ DRESULT SD_disk_read(BYTE pdrv, BYTE* buff, DWORD sector, UINT count) {
             } while (token == 0xFF && HAL_GetTick() < t);
 
             if (token == 0xFE) {
-                // ИСПРАВЛЕНИЕ: Читаем строго побайтово, отправляя 0xFF
+                // FIX: Read strictly byte-by-byte, sending 0xFF
                 for (UINT i = 0; i < 512; i++) {
                     buff[i] = SPI_RxByte();
                 }
-                SPI_RxByte(); SPI_RxByte(); // Пропуск CRC
+                SPI_RxByte(); SPI_RxByte(); // Skip CRC
                 res = RES_OK;
             } else {
-                APP_LOG(TS_ON, VLEVEL_L, "DEBUG: Read token err = 0x%02X\r\n", token);
+                APP_LOG(TS_ON, VLEVEL_L, "Read token err = 0x%02X\r\n", token);
             }
         }
     }
@@ -186,12 +186,12 @@ DRESULT SD_disk_write(BYTE pdrv, const BYTE* buff, DWORD sector, UINT count) {
     if (count == 1) {
         if ((SD_SendCmd(CMD24, sector) == 0) && (SD_ReadyWait() == 0xFF)) {
 
-            // Стартовый токен данных
+            // Data start token
             uint8_t start_tok = 0xFE;
             uint8_t dummy = 0xFF;
             HAL_SPI_TransmitReceive(&HSPI_SDCARD, &start_tok, &dummy, 1, 10);
 
-            // Пишем строго побайтово
+            // Write strictly byte-by-byte
             for (UINT i = 0; i < 512; i++) {
                 HAL_SPI_TransmitReceive(&HSPI_SDCARD, (uint8_t*)&buff[i], &dummy, 1, 10);
             }
@@ -204,7 +204,7 @@ DRESULT SD_disk_write(BYTE pdrv, const BYTE* buff, DWORD sector, UINT count) {
             if ((dataRes & 0x1F) == 0x05) {
                 if (SD_ReadyWait() == 0xFF) res = RES_OK;
             } else {
-                APP_LOG(TS_ON, VLEVEL_L, "DEBUG: Write err = 0x%02X\r\n", dataRes);
+                APP_LOG(TS_ON, VLEVEL_L, "Write err = 0x%02X\r\n", dataRes);
             }
         }
     }
