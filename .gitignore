@@ -1,0 +1,19 @@
+# Escludi le cartelle di output della compilazione
+Debug/
+Release/
+bin/
+obj/
+
+# Escludi i file binari e i log di compilazione
+*.elf
+*.map
+*.list
+*.o
+*.d
+*.su
+*.hex
+*.bin
+
+# File temporanei o specifici dell'utente
+.settings/
+*.launch
