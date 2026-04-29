@@ -292,6 +292,7 @@ static void commUsart2(void);
 static void printOnUart(void);
 static void OnReadTimerEvent(void *context);
 uint16_t Read_ADC_Value(void);
+static void DumpSDToUart(const char* filename);
 
 /* USER CODE END PFP */
 
@@ -536,6 +537,78 @@ void readCO2(void)
     //HAL_Delay(30);
 }
 
+static void DumpSDToUart(const char* filename)
+{
+    FATFS fs;           // Workspace per il file system
+    FIL fil;
+    FRESULT fr;
+    uint8_t readBuffer[128];
+    UINT bytesRead;
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // 1) Risveglio hardware
+    HAL_PWREx_DisablePullUpPullDownConfig();
+    HAL_GPIO_WritePin(GPIOA, CS_SD_Pin, GPIO_PIN_SET); // CS Alto prima di alimentare
+
+    GPIO_InitStruct.Pin = CS_SD_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(CS_SD_GPIO_Port, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(GPIOA, MOS_SD_ONOFF_Pin, GPIO_PIN_RESET); // Accendi SD
+    HAL_Delay(100);
+
+    MX_SPI1_Init();
+    MX_FATFS_Init();
+
+    // 2) MONTAGGIO DEL FILE SYSTEM (Fondamentale!)
+    // Il parametro '1' forza il montaggio immediato (inizializza il bus SPI)
+    fr = f_mount(&fs, "", 1);
+
+    if (fr == FR_OK) {
+        // 3) Apertura del file
+        fr = f_open(&fil, filename, FA_READ);
+
+        if (fr == FR_OK) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"--- START OF LOG ---\r\n", 22, 100);
+
+            while (f_read(&fil, readBuffer, sizeof(readBuffer), &bytesRead) == FR_OK && bytesRead > 0) {
+                HAL_UART_Transmit(&huart2, readBuffer, bytesRead, 1000);
+            }
+
+            f_close(&fil);
+            HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n--- END OF LOG ---\r\n", 22, 100);
+        } else {
+            char errMsg[40];
+            snprintf(errMsg, sizeof(errMsg), "f_open err: %d\r\n", (int)fr);
+            HAL_UART_Transmit(&huart2, (uint8_t*)errMsg, strlen(errMsg), 100);
+        }
+
+        // Smonta il volume per pulizia
+        f_mount(NULL, "", 0);
+
+    } else {
+        char errMsg[40];
+        snprintf(errMsg, sizeof(errMsg), "f_mount err: %d\r\n", (int)fr);
+        HAL_UART_Transmit(&huart2, (uint8_t*)errMsg, strlen(errMsg), 100);
+    }
+
+    // 4) Cleanup e spegnimento
+    MX_FATFS_deInit();
+    HAL_SPI_DeInit(&hspi1);
+
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_5;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_6 | CS_SD_Pin;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(GPIOA, MOS_SD_ONOFF_Pin, GPIO_PIN_SET);
+    HAL_PWREx_EnablePullUpPullDownConfig();
+}
+
 static void LogToSDCard(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -570,29 +643,25 @@ static void LogToSDCard(void)
     char logBuffer[256];
     int pos = 0;
     uint16_t mSeconds;
-    uint32_t totalSeconds;
-    char uartBuf[50];
+    uint32_t totalSeconds = TIMER_IF_GetTime(&mSeconds);
+    //char uartBuf[50];
 
-    totalSeconds = TIMER_IF_GetTime(&mSeconds);
-
-    // Aggiungiamo il timestamp iniziale
+    // Inseriamo il timestamp all'inizio della riga
     pos += snprintf(logBuffer + pos, sizeof(logBuffer) - pos, "%lu", totalSeconds);
 
-    // Formattiamo la stringa: il %lu serve per i numeri "long unsigned" (32 bit)
-    int len = snprintf(uartBuf, sizeof(uartBuf), "Timestamp RTC: %lu.%03u s\r\n", totalSeconds, mSeconds);
-    HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, len, 100);
+    // Calcoliamo l'inizio dell'ultima "finestra" di dati.
+    // Ogni record completo occupa 10 byte (3 CO2 + T + RH).
+    uint8_t start_of_record = (buffer_index >= 10) ? (buffer_index - 10) : 0;
 
-    // Cicliamo su AppDataBuffer a passi di 2 (dato che ogni valore è uint16_t)
-    for (uint8_t j = 0; j + 1 < buffer_index; j += 2)
+    // Cicliamo solo sui 10 byte appena inseriti
+    for (uint8_t j = start_of_record; j + 1 < buffer_index; j += 2)
     {
         uint16_t val = (uint16_t)AppDataBuffer[j] | ((uint16_t)AppDataBuffer[j + 1] << 8);
         pos += snprintf(logBuffer + pos, sizeof(logBuffer) - pos, ",%u", val);
-
-        // Protezione per non eccedere la dimensione del logBuffer
-        if (pos >= sizeof(logBuffer) - 10) break;
     }
 
-    strcat(logBuffer, "\n");
+    // Aggiungiamo il terminatore di riga corretto per CSV (CR+LF)
+    strcat(logBuffer, "\r\n");
 
     FRESULT fr = SD_Log_String("log.csv", logBuffer);
     if (fr == FR_OK) {
@@ -772,8 +841,6 @@ void commUsart1(void)
 				//len = sprintf(out, "value %d ppm\r\n", newValue);
 				//HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
 
-
-				// Accumulo su buf_co2 e conto fino a 10 letture
 				buf_co2[i++] = newValue;
 				if(i <= readings) sensornum = 1;
 				else if(i>readings && i<=readings*2) sensornum = 2;
@@ -1046,6 +1113,14 @@ void commUsart2(void)
         len = sprintf(out, "Manual selection: CO2 Sensor %d active\r\n", sensornum);
         HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
 
+        PCPtr = 0;
+        return;
+    }
+
+    // Comando 'r' per leggere l'intero contenuto della SD
+    if (RdPCBuffer[PCPtr] == 'r') {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"Reading SD card, please wait...\r\n", 33, 100);
+        DumpSDToUart("log.csv");
         PCPtr = 0;
         return;
     }
