@@ -105,6 +105,7 @@ volatile uint8_t tx_in_progress = 0;
 uint16_t readingInterval = 500;
 bool finished;
 uint8_t sensornum;
+static bool waitingForDeleteConfirm = false;
 
 sht3x_handle_t sht30 = {
     .i2c_handle = &hi2c2,
@@ -293,6 +294,7 @@ static void printOnUart(void);
 static void OnReadTimerEvent(void *context);
 uint16_t Read_ADC_Value(void);
 static void DumpSDToUart(const char* filename);
+static void ClearLogFile(const char* filename);
 
 /* USER CODE END PFP */
 
@@ -595,6 +597,65 @@ static void DumpSDToUart(const char* filename)
     }
 
     // 4) Cleanup e spegnimento
+    MX_FATFS_deInit();
+    HAL_SPI_DeInit(&hspi1);
+
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_5;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_6 | CS_SD_Pin;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(GPIOA, MOS_SD_ONOFF_Pin, GPIO_PIN_SET);
+    HAL_PWREx_EnablePullUpPullDownConfig();
+}
+
+static void ClearLogFile(const char* filename)
+{
+    FATFS fs;
+    FIL fil;
+    FRESULT fr;
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // 1) Risveglio hardware (sequenza standard)
+    HAL_PWREx_DisablePullUpPullDownConfig();
+    HAL_GPIO_WritePin(GPIOA, CS_SD_Pin, GPIO_PIN_SET);
+
+    GPIO_InitStruct.Pin = CS_SD_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(CS_SD_GPIO_Port, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(GPIOA, MOS_SD_ONOFF_Pin, GPIO_PIN_RESET);
+    HAL_Delay(100);
+
+    MX_SPI1_Init();
+    MX_FATFS_Init();
+
+    // 2) Montaggio e Apertura con flag di creazione sempre (sovrascrive)
+    fr = f_mount(&fs, "", 1);
+    if (fr == FR_OK) {
+        // FA_CREATE_ALWAYS: se il file esiste, lo svuota e lo porta a 0 byte
+        fr = f_open(&fil, filename, FA_WRITE | FA_CREATE_ALWAYS);
+
+        if (fr == FR_OK) {
+            f_close(&fil);
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Log file cleared successfully.\r\n", 32, 100);
+        } else {
+            char errMsg[40];
+            snprintf(errMsg, sizeof(errMsg), "Clear Error (open): %d\r\n", (int)fr);
+            HAL_UART_Transmit(&huart2, (uint8_t*)errMsg, strlen(errMsg), 100);
+        }
+        f_mount(NULL, "", 0);
+    } else {
+        char errMsg[40];
+        snprintf(errMsg, sizeof(errMsg), "Clear Error (mount): %d\r\n", (int)fr);
+        HAL_UART_Transmit(&huart2, (uint8_t*)errMsg, strlen(errMsg), 100);
+    }
+
+    // 3) Cleanup e spegnimento hardware
     MX_FATFS_deInit();
     HAL_SPI_DeInit(&hspi1);
 
@@ -1113,6 +1174,32 @@ void commUsart2(void)
         len = sprintf(out, "Manual selection: CO2 Sensor %d active\r\n", sensornum);
         HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
 
+        PCPtr = 0;
+        return;
+    }
+
+    // Se siamo in attesa di conferma per la cancellazione
+    if (waitingForDeleteConfirm) {
+        if (RdPCBuffer[PCPtr] == 'y' || RdPCBuffer[PCPtr] == 'Y') {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"\r\nConfirmed. Clearing SD log...\r\n", 34, 100);
+            ClearLogFile("log.csv");
+            waitingForDeleteConfirm = false;
+        }
+        else if (RdPCBuffer[PCPtr] == 'n' || RdPCBuffer[PCPtr] == 'N') {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"\r\nDeletion cancelled.\r\n", 23, 100);
+            waitingForDeleteConfirm = false;
+        }
+        else {
+            HAL_UART_Transmit(&huart2, (uint8_t*)"\r\nPlease press 'y' to confirm or 'n' to cancel: ", 48, 100);
+        }
+        PCPtr = 0;
+        return;
+    }
+
+    // Comando 'd' iniziale
+    if (RdPCBuffer[PCPtr] == 'd') {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\nWARNING: This will delete ALL logs. Are you sure? (y/n): ", 59, 100);
+        waitingForDeleteConfirm = true;
         PCPtr = 0;
         return;
     }
