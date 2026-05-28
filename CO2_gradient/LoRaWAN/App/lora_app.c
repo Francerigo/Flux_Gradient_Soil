@@ -72,6 +72,10 @@ extern void SD_Force_Reinit(void);
 #define DS18B20_CMD_CONVERTT         0x44
 #define DS18B20_CMD_READSCRATCHPAD   0xBE
 
+// Definizioni per chiarezza
+#define SENSORS_POWER_ON()  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET)
+#define SENSORS_POWER_OFF() HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET)
+
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 extern uint8_t rx_buff[1];
@@ -295,6 +299,8 @@ static void OnReadTimerEvent(void *context);
 uint16_t Read_ADC_Value(void);
 static void DumpSDToUart(const char* filename);
 static void ClearLogFile(const char* filename);
+void Select_Mux_Channel(uint8_t ch);
+
 
 /* USER CODE END PFP */
 
@@ -501,7 +507,7 @@ void LoRaWAN_Init(void)
     }
 }
 */
-
+/*
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 
@@ -515,7 +521,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 		 UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_USART2), CFG_SEQ_Prio_0);
 	 }
 
-}
+}*/
 
 
 uint16_t average_u16_int(const uint16_t *arr, size_t len, uint8_t index) {
@@ -530,6 +536,13 @@ uint16_t average_u16_int(const uint16_t *arr, size_t len, uint8_t index) {
 
     // Integer division will truncate toward zero.
     return (uint16_t)(sum / len);
+}
+
+// Funzione helper per il Multiplexer (ADG708)
+void Select_Mux_Channel(uint8_t ch) {
+    HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, (ch & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, (ch & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, (ch & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 void readCO2(void)
@@ -711,8 +724,8 @@ static void LogToSDCard(void)
     pos += snprintf(logBuffer + pos, sizeof(logBuffer) - pos, "%lu", totalSeconds);
 
     // Calcoliamo l'inizio dell'ultima "finestra" di dati.
-    // Ogni record completo occupa 10 byte (3 CO2 + T + RH).
-    uint8_t start_of_record = (buffer_index >= 10) ? (buffer_index - 10) : 0;
+    // Ogni record completo occupa 22 byte (3 CO2 + T + RH + 3 soil moist).
+    uint8_t start_of_record = (buffer_index >= 22) ? (buffer_index - 22) : 0;
 
     // Cicliamo solo sui 10 byte appena inseriti
     for (uint8_t j = start_of_record; j + 1 < buffer_index; j += 2)
@@ -756,30 +769,41 @@ static void LogToSDCard(void)
 
 uint16_t Read_ADC_Value(void)
 {
-	uint32_t adc_val = 0;
-	    uint32_t percentage_scaled = 0;
+    ADC_ChannelConfTypeDef sConfig = {0};
+    uint32_t adc_val = 0;
+    float voltage = 0.0f;
+    float vwcValue = 0.0f;
+    char uartBuf[128];
 
-	    if (HAL_ADC_Start(&hadc) != HAL_OK) return 0;
+    // Configura esplicitamente il Canale 4 (associato a PB2)
+    sConfig.Channel = ADC_CHANNEL_4;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_160CYCLES_5; // Tempo lungo per stabilizzare il MUX
+    if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK) return 0;
 
-	    if (HAL_ADC_PollForConversion(&hadc, 10) == HAL_OK)
-	    {
-	        adc_val = HAL_ADC_GetValue(&hadc);
+    if (HAL_ADC_Start(&hadc) != HAL_OK) return 0;
 
-	        // Applichiamo il clamping per evitare valori fuori range
-	        if (adc_val <= ADC_DRY) {
-	            percentage_scaled = 0;
-	        }
-	        else if (adc_val >= ADC_WET) {
-	            percentage_scaled = 10000; // Rappresenta il 100.00%
-	        }
-	        else {
-	            // Formula di mappatura: ((val - min) * 10000) / (max - min)
-	            percentage_scaled = ((adc_val - ADC_DRY) * 10000) / (ADC_WET - ADC_DRY);
-	        }
-	    }
-	    HAL_ADC_Stop(&hadc);
+    if (HAL_ADC_PollForConversion(&hadc, 10) == HAL_OK)
+    {
+        adc_val = HAL_ADC_GetValue(&hadc);
+        voltage = (adc_val * 3.3f) / 4095.0f;
 
-	    return (uint16_t)percentage_scaled;
+        // Equazione VWC...
+        vwcValue = (2.8432f * voltage * voltage * voltage) -
+                   (9.1993f * voltage * voltage) +
+                   (20.2553f * voltage) - 4.1882f;
+
+        if (vwcValue < 0.0f) vwcValue = 0.0f;
+        if (vwcValue > 100.0f) vwcValue = 100.0f;
+
+        int len = snprintf(uartBuf, sizeof(uartBuf),
+                           "Raw: %lu | V: %.3fV | VWC: %.2f%%\r\n",
+                           adc_val, voltage, vwcValue);
+        HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, len, 100);
+    }
+    HAL_ADC_Stop(&hadc);
+
+    return (uint16_t)(vwcValue * 100.0f);
 }
 
 void printOnUart(void){
@@ -1002,19 +1026,6 @@ void commUsart1(void)
                         ///////////////////////////////////////////////////////////////////////////////////////////////
 						///////////////////////////////////////////////////////////////////////////////////////////////
 						///////////////////////////////////////////////////////////////////////////////////////////////
-/*
-						// 2. Lettura DS18B20 (Temperatura Suolo - Canali MUX 0, 1, 2)
-					    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET); // MUXADC_EN ON
-
-					    // Switch PB2 a modalità GPIO per protocollo 1-Wire
-					    GPIO_InitTypeDef GPIO_InitStruct = {0};
-					    GPIO_InitStruct.Pin = GPIO_PIN_2; // PB2
-					    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD; // Open Drain per 1-Wire
-					    GPIO_InitStruct.Pull = GPIO_PULLUP;
-					    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-					    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-					    for (uint8_t ch = 0; ch < 3; ch++) {
 					        // Selezione Canale MUX
 					    	// ch will vary between 0 and 2
 					    	// when ch = 0:
@@ -1030,33 +1041,63 @@ void commUsart1(void)
 					    	// ch & 0x02 = 010 & 010 = 010 = TRUE
 					    	// ch & 0x04 = 010 & 100 = 000 = FALSE
 
-					        HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, (ch & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-					        HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, (ch & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-					        HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, (ch & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-					        HAL_Delay(10);
 
-					        // Chiamata alla funzione helper per DS18B20 (che include il delay di conversione)
-					        int16_t soil_temp = Read_Soil_Temp_Scaled();
+							// when ch = 7:
+							// ch & 0x01 = 111 & 001 = 001 = TRUE
+							// ch & 0x02 = 111 & 010 = 010 = TRUE
+							// ch & 0x04 = 111 & 100 = 100 = TRUE
+						// 2. Lettura DS18B20 (Temperatura Suolo)
+						// 1. Attivazione alimentazione sensori
+						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET); // MUXADC_EN ON
+						// --- 1. ACCENSIONE ALIMENTAZIONE ---
+						SENSORS_POWER_ON();
+						HAL_Delay(100); // Tempo di stabilizzazione per tutti i sensori
 
-					        AppDataBuffer[buffer_index++] = (uint8_t)(soil_temp & 0xFF);
-					        AppDataBuffer[buffer_index++] = (uint8_t)((soil_temp >> 8) & 0xFF);
-					    }
-					    // 3. Lettura SoilWatch 10 (Umidità Suolo - Canali MUX 3, 4, 5)
-					    // Riporta PB2 in modalità ADC
-					    MX_ADC_Init(); // Re-inizializza l'ADC per configurare PB2 come ADC_IN4
+						// --- 2. LETTURA DEI 3 SENSORI DI TEMPERATURA (Ch 0, 1, 2) ---
+						for (uint8_t ch = 0; ch < 3; ch++) {
+						    Select_Mux_Channel(ch);
+						    HAL_Delay(10);
 
-					    for (uint8_t ch = 3; ch < 6; ch++) {
-					        HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, (ch & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-					        HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, (ch & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-					        HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, (ch & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-					        HAL_Delay(5);
-					        uint16_t adc_val = Read_ADC_Value(); // Funzione helper ADC
-					        AppDataBuffer[buffer_index++] = (uint8_t)(adc_val & 0xFF);
-					        AppDataBuffer[buffer_index++] = (uint8_t)((adc_val >> 8) & 0xFF);
-					    }
+						    // Forza PB2 in modalità Digitale Open Drain per 1-Wire
+						    GPIO_InitTypeDef GPIO_InitStruct = {0};
+						    GPIO_InitStruct.Pin = GPIO_PIN_2;
+						    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+						    GPIO_InitStruct.Pull = GPIO_PULLUP;
+						    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+						    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-					    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET); // MUXADC_EN OFF
-*/
+						    int16_t soil_temp = Read_Soil_Temp_Scaled();
+
+						    AppDataBuffer[buffer_index++] = (uint8_t)(soil_temp & 0xFF);
+						    AppDataBuffer[buffer_index++] = (uint8_t)((soil_temp >> 8) & 0xFF);
+						}
+
+						// --- 3. TRANSIZIONE A MODALITÀ ANALOGICA ---
+						GPIO_InitTypeDef GPIO_InitStruct = {0};
+						GPIO_InitStruct.Pin = GPIO_PIN_2;
+						GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+						GPIO_InitStruct.Pull = GPIO_NOPULL;
+						HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+						MX_ADC_Init();
+						HAL_ADCEx_Calibration_Start(&hadc);
+
+						// --- 4. LETTURA DEI 3 SENSORI DI UMIDITÀ (Ch 4, 5, 6) ---
+						for (uint8_t ch = 4; ch < 7; ch++) {
+						    Select_Mux_Channel(ch);
+						    HAL_Delay(20);
+
+						    uint16_t vwc_val = Read_ADC_Value();
+
+						    AppDataBuffer[buffer_index++] = (uint8_t)(vwc_val & 0xFF);
+						    AppDataBuffer[buffer_index++] = (uint8_t)((vwc_val >> 8) & 0xFF);
+						}
+
+						// Spegnimento sensori
+						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET); // MUXADC_EN OFF
+						// --- 5. SPEGNIMENTO ALIMENTAZIONE ---
+						SENSORS_POWER_OFF();
+
 					    ///////////////////////////////////////////////////////////////////////////////////////////////
 					    ///////////////////////////////////////////////////////////////////////////////////////////////
 					    ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -1068,7 +1109,7 @@ void commUsart1(void)
 				        // I also have 4 bytes for T + RH, which makes the total increase to 10 bytes
 						// I also have 2 bytes per soil sensor, which means 12 bytes
 						// In total, it comes to 22 bytes of data
-						if (buffer_index >= 50)
+						if (buffer_index >= 68)
 						{
 							if(lora){
 							    AppData.BufferSize = buffer_index;
@@ -1417,8 +1458,10 @@ static void OnTxTimerEvent(void *context)
 		  //UTIL_TIMER_Start(&ReadTimer);
 	  }
 
-
+	  UTIL_TIMER_Start(&TxTimer);
+	  return;
   /* USER CODE END OnTxTimerEvent_1 */
+  UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_LoRaSendOnTxTimerOrButtonEvent), CFG_SEQ_Prio_0);
 
   /*Wait for next tx slot*/
   UTIL_TIMER_Start(&TxTimer);

@@ -131,7 +131,7 @@ void PWR_ExitStopMode(void)
   /* Resume not retained USARTx and DMA */
   vcom_Resume();
   /* USER CODE BEGIN ExitStopMode_2 */
-  MX_ADC_Init();
+  //MX_ADC_Init();
   MX_I2C2_Init();
 
   /* USER CODE END ExitStopMode_2 */

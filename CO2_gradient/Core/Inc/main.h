@@ -64,6 +64,8 @@ void Error_Handler(void);
 #define MUX_A1_GPIO_Port GPIOB
 #define MUX_A2_Pin GPIO_PIN_4
 #define MUX_A2_GPIO_Port GPIOB
+#define SOILTH_ONOFF_Pin GPIO_PIN_0
+#define SOILTH_ONOFF_GPIO_Port GPIOA
 #define CS_SD_Pin GPIO_PIN_4
 #define CS_SD_GPIO_Port GPIOA
 #define MOS_SD_ONOFF_Pin GPIO_PIN_5

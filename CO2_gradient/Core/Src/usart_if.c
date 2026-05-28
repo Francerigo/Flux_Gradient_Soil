@@ -26,6 +26,7 @@
 #include "string.h"
 #include "stdlib.h"
 #include "stdio.h"
+#include "stm32_seq.h"
 
 /* USER CODE END Includes */
 
@@ -239,6 +240,31 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   /* USER CODE END HAL_UART_TxCpltCallback_2 */
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  /* USER CODE BEGIN HAL_UART_RxCpltCallback_1 */
+	if (huart->Instance == USART1){
+		UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_USART1), CFG_SEQ_Prio_0);
+		return;
+	}
+
+	if (huart->Instance == USART2){
+		UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_USART2), CFG_SEQ_Prio_0);
+		return;
+	}
+  /* USER CODE END HAL_UART_RxCpltCallback_1 */
+  if (huart->Instance == USART2)
+  {
+    if ((NULL != RxCpltCallback) && (HAL_UART_ERROR_NONE == huart->ErrorCode))
+    {
+      RxCpltCallback(&charRx, 1, 0);
+    }
+    HAL_UART_Receive_IT(huart, &charRx, 1);
+  }
+  /* USER CODE BEGIN HAL_UART_RxCpltCallback_2 */
+
+  /* USER CODE END HAL_UART_RxCpltCallback_2 */
+}
 
 /* USER CODE BEGIN EF */
 
