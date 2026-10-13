@@ -84,7 +84,7 @@ extern ADC_HandleTypeDef hadc;
 
 
 uint8_t readings = 30;
-uint16_t buf_co2[100];
+uint16_t buf_co2[120];
 uint16_t avg_co2 = 0;
 uint8_t i = 0;
 uint8_t TxBufferFilteredReading[3]="Z\r\n";
@@ -153,7 +153,7 @@ typedef enum TxEventType_e
 #define JOIN_TIME 2000
 
 /*---------------------------------------------------------------------------*/
-/*                             LoRaWAN NVM configuration                     */
+/* LoRaWAN NVM configuration                     */
 /*---------------------------------------------------------------------------*/
 /**
   * @brief LoRaWAN NVM Flash address
@@ -296,10 +296,12 @@ static void commUsart1(void);
 static void commUsart2(void);
 static void printOnUart(void);
 static void OnReadTimerEvent(void *context);
+static void OnManualTimerEvent(void *context);
 uint16_t Read_ADC_Value(void);
 static void DumpSDToUart(const char* filename);
 static void ClearLogFile(const char* filename);
 void Select_Mux_Channel(uint8_t ch);
+void Initialize_All_Sensors_To_Mode2(void);
 
 
 /* USER CODE END PFP */
@@ -378,6 +380,7 @@ static UTIL_TIMER_Object_t StopJoinTimer;
 /* USER CODE BEGIN PV */
 
 static UTIL_TIMER_Object_t ReadTimer;
+static UTIL_TIMER_Object_t ManualTimer;
 
 /**
   * @brief User application buffer
@@ -493,8 +496,10 @@ void LoRaWAN_Init(void)
   }
 
   /* USER CODE BEGIN LoRaWAN_Init_Last */
+  UTIL_TIMER_Create(&ManualTimer, 2000, UTIL_TIMER_ONESHOT, OnManualTimerEvent, NULL);
   UTIL_TIMER_Create(&ReadTimer, readingInterval, UTIL_TIMER_ONESHOT, OnReadTimerEvent, NULL);
   DWT_Init();
+  //Initialize_All_Sensors_To_Mode2();
   /* USER CODE END LoRaWAN_Init_Last */
 }
 
@@ -724,10 +729,10 @@ static void LogToSDCard(void)
     pos += snprintf(logBuffer + pos, sizeof(logBuffer) - pos, "%lu", totalSeconds);
 
     // Calcoliamo l'inizio dell'ultima "finestra" di dati.
-    // Ogni record completo occupa 22 byte (3 CO2 + T + RH + 3 soil moist).
-    uint8_t start_of_record = (buffer_index >= 22) ? (buffer_index - 22) : 0;
+    // Ogni record completo occupa 24 byte (4 CO2 + T + RH + 3 soil moist).
+    uint8_t start_of_record = (buffer_index >= 24) ? (buffer_index - 24) : 0;
 
-    // Cicliamo solo sui 10 byte appena inseriti
+    // Cicliamo solo sui byte appena inseriti
     for (uint8_t j = start_of_record; j + 1 < buffer_index; j += 2)
     {
         uint16_t val = (uint16_t)AppDataBuffer[j] | ((uint16_t)AppDataBuffer[j + 1] << 8);
@@ -806,6 +811,77 @@ uint16_t Read_ADC_Value(void)
     return (uint16_t)(vwcValue * 100.0f);
 }
 
+void Initialize_All_Sensors_To_Mode2(void)
+{
+    char out_init[50];
+    uint16_t len;
+
+    for (uint8_t s = 1; s <= 4; s++)
+    {
+        len = sprintf(out_init, "Forcing Sensor %d to Mode 2...\r\n", s);
+        HAL_UART_Transmit(&huart2, (uint8_t*)out_init, len, 100);
+
+        // Seleziona il canale del MUX per il sensore corrente
+        if (s == 1) {
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        }
+        else if (s == 2) {
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        }
+        else if (s == 3) {
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        }
+        else if (s == 4) {
+            HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        }
+
+        HAL_Delay(50); // Stabilizzazione canale MUX
+
+        // Prepariamo la UART e resettiamo i buffer locali temporaneamente
+        InS = 0;
+        memset(RdBuffer, 0, BUFFSIZE);
+        __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
+        volatile uint32_t tmpreg_loop = huart1.Instance->RDR;
+        UNUSED(tmpreg_loop);
+
+        HAL_UART_Receive_IT(&huart1, rx_buff, 1);
+
+        // Invia il comando di cambio modalità
+        HAL_UART_Transmit(&huart1, (uint8_t*)("K 2\r\n"), 5, 0xFFFF);
+
+        // Attendiamo la risposta del sensore
+        HAL_Delay(200);
+    }
+
+    // Ripristiniamo il MUX sul sensore 1 per l'inizio del ciclo automatico
+    HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+    sensornum = 1;
+    i = 0;
+
+    InS = 0;
+    memset(RdBuffer, 0, BUFFSIZE);
+    __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
+
+    // DICHIARAZIONE CORRETTA QUI: Aggiunto il tipo volatile uint32_t per correggere l'errore del compilatore
+    volatile uint32_t tmpreg_end = huart1.Instance->RDR;
+    UNUSED(tmpreg_end);
+
+    HAL_UART_Receive_IT(&huart1, rx_buff, 1);
+
+    len = sprintf(out_init, "All sensors initialized to Mode 2\r\n");
+    HAL_UART_Transmit(&huart2, (uint8_t*)out_init, len, 100);
+}
+
 void printOnUart(void){
 	// 1) Reset tx buffer length (important!)
 	int pos = 0;
@@ -852,7 +928,6 @@ void commUsart1(void)
 	///////////////////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////
 
-
 	if (selection == 1){
 
 		HAL_UART_Receive_IT(&huart1, rx_buff, 1);
@@ -862,9 +937,7 @@ void commUsart1(void)
 				if (mode == 1){
 					readf = atoi((char*)RdBuffer + 3);
 					readnf = atoi((char*)RdBuffer + 11);
-					//float t = HAL_GetTick() / 1000.0f;
 					len = sprintf(out, ",%d,%d\r\n", readf, readnf);
-					//len = sprintf(out, "Filtered CO2 concentration: %d ppm\r\nNon filtered CO2 concentration: %d ppm\r\n\n", readf, readnf);
 					HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
 					InS = 0;
 				}
@@ -895,7 +968,6 @@ void commUsart1(void)
 		}
 	}
 
-
 	///////////////////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////
 	// Modalità Automatica
@@ -904,255 +976,261 @@ void commUsart1(void)
 	///////////////////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////
 
-
-
 	else if (selection == 2){
-		// 1) Re‐armo subito per la prossima singola lettura
-		HAL_UART_Receive_IT(&huart1, rx_buff, 1);
+			// 1) Re‐armo subito per la prossima singola lettura
+			HAL_UART_Receive_IT(&huart1, rx_buff, 1);
 
-		// 2) Metto il byte ricevuto in RdBuffer[InS]
-		RdBuffer[InS] = rx_buff[0];
+			// 2) Metto il byte ricevuto in RdBuffer[InS]
+			RdBuffer[InS] = rx_buff[0];
 
-		// 3) Se ho chiuso la riga ("\n") o ho saturato il buffer:
-		if (RdBuffer[InS++] == '\n' || InS == BUFFSIZE)
-		{
-			InS = 0;
-
-			//  3a) Se è una riga di risposta CO2 (secondo carattere = 'Z')
-			if (RdBuffer[1] == 'Z' && mode == 2)
+			// 3) Se ho chiuso la riga ("\n") o ho saturato il buffer:
+			if (RdBuffer[InS++] == '\n' || InS == BUFFSIZE)
 			{
-				// Estraggo il valore numerico
-				uint16_t newValue = (uint16_t)atoi((char*)RdBuffer + 3);
-				//len = sprintf(out, "value %d ppm\r\n", newValue);
-				//HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+				InS = 0;
 
-				buf_co2[i++] = newValue;
-				if(i <= readings) sensornum = 1;
-				else if(i>readings && i<=readings*2) sensornum = 2;
-				else sensornum = 3;
-
-				//readings is the number of readings we take from each sensor, which are to be averaged
-				if (i == readings || i == 2*readings || i == 3*readings)
+				//  3a) Se è una riga di risposta CO2 (secondo carattere = 'Z')
+				if (RdBuffer[1] == 'Z' && mode == 2)
 				{
+					// Estraggo il valore numerico
+					uint16_t newValue = (uint16_t)atoi((char*)RdBuffer + 3);
 
-					avg_co2 = average_u16_int(buf_co2, readings, sensornum);
+					// Allocazione lineare basata sull'offset assoluto del sensore attivo per preservare average_u16_int
+					uint8_t absolute_index = (readings * (sensornum - 1)) + i;
+					buf_co2[absolute_index] = newValue;
+					i++;
 
-					len = sprintf(out, "%d samples average for sensor %d: %d ppm\r\n", readings, sensornum, avg_co2);
-					HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+					// Se abbiamo raggiunto il numero corretto di letture per il sensore corrente
+					if (i == readings)
+					{
+						// Calcoliamo la media passando l'array popolato linearmente
+						avg_co2 = average_u16_int(buf_co2, readings, sensornum);
 
-					// Metto i due byte di avg_co2 in AppDataBuffer
-					AppDataBuffer[buffer_index++] = (uint8_t)(avg_co2 & 0xFF);
-					AppDataBuffer[buffer_index++] = (uint8_t)((avg_co2 >> 8) & 0xFF);
-					//AppData.BufferSize = buffer_index;
-					if (sensornum == 3){
-						finished = true;
+						len = sprintf(out, "%d samples average for sensor %d: %d ppm\r\n", readings, sensornum, avg_co2);
+						HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+
+						// Metto i due byte di avg_co2 in AppDataBuffer
+						AppDataBuffer[buffer_index++] = (uint8_t)(avg_co2 & 0xFF);
+						AppDataBuffer[buffer_index++] = (uint8_t)((avg_co2 >> 8) & 0xFF);
+
+						// Azziamo l'indice locale dei campioni, pronti per il prossimo sensore
 						i = 0;
+
+						if (sensornum == 4){
+							finished = true;
+						}
+
+						// Mandiamo in sleep il sensore corrente
+						InS = 0;
+						memset(RdBuffer, 0, BUFFSIZE);
+						HAL_UART_Receive_IT(&huart1, rx_buff, 1);
+				        HAL_UART_Transmit(&huart1, (uint8_t*)("K 0\r\n"), 5, 0xFFFF);
+
+						return;
 					}
 
-					// sending the command to sleep to whatever sensor is selected
-			        HAL_UART_Transmit(&huart1, (uint8_t*)("K 0\r\n"), 5, 0xFFFF);
-
+					// Se non ha ancora raggiunto i campioni richiesti, continua
+					UTIL_TIMER_Start(&ReadTimer);
 					return;
 				}
 
-				UTIL_TIMER_Start(&ReadTimer);
-				return;
-			}
+				//  3b) Se è un comando di cambio modalità (“K …”)
+				else if (RdBuffer[1] == 'K')
+				{
+					uint16_t newMode = (uint16_t)atoi((char*)RdBuffer + 2);
+					mode = (uint8_t)newMode;
 
-			//  3b) Se è un comando di cambio modalità (“K …”)
-			else if (RdBuffer[1] == 'K')
-			{
-
-				uint16_t newMode = (uint16_t)atoi((char*)RdBuffer + 2);
-				mode = (uint8_t)newMode;
-
-				if(mode == 0){
-					len = sprintf(out, "Mode 0 inserted for sensor %d\r\n", sensornum);
-					HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
-					if (sensornum == 1){
-						//switch to sensor 2
-
-						//CO2 sensor x      (bitmap A2 A1 A0)
-						//CO2 sensor CO2_1  (bitmap 0  0  1)
-						//CO2 sensor CO2_2  (bitmap 0  1  1)
-						//CO2 sensor CO2_3  (bitmap 0  0  0)
-
-						HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
-						HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
-						HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
-						sensornum = 2;
-			        	// insert the measurement mode to the new sensor selected,
-			        	//which will trigger again the ReadTimer timer
-			        	HAL_UART_Transmit(&huart1, (uint8_t*)("K 2\r\n"), 5, 0xFFFF);
-					}
-					else if (sensornum == 2){
-					 	//switch to sensor 3
-
-					   	//CO2 sensor x      (bitmap A2 A1 A0)
-					   	//CO2 sensor CO2_1  (bitmap 0  0  1)
-					  	//CO2 sensor CO2_2  (bitmap 0  1  1)
-					   	//CO2 sensor CO2_3  (bitmap 0  0  0)
-
-			        	HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
-			        	HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
-			        	HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
-			        	sensornum = 3;
-			        	// insert the measurement mode to the new sensor selected,
-			        	//which will trigger again the ReadTimer timer
-			        	HAL_UART_Transmit(&huart1, (uint8_t*)("K 2\r\n"), 5, 0xFFFF);
-			        }
-			        else{
-			        	// you have finished to read all the three sensors
-						if (!sht3x_init(&sht30)) {
-							HAL_UART_Transmit(&huart2, (uint8_t*)"SHT3x access fail\r\n", 19, 100);
-						}
-						float temperature, humidity;
-						sht3x_read_temperature_and_humidity(&sht30, &temperature, &humidity);
-
-						int16_t temp_scaled = (int16_t)(temperature * 100);
-						uint16_t hum_scaled = (uint16_t)(humidity * 100);
-
-						// Inserting temp in AppDataBuffer (2 bytes, LSB first)
-						AppDataBuffer[buffer_index++] = (uint8_t)(temp_scaled & 0xFF);
-						AppDataBuffer[buffer_index++] = (uint8_t)((temp_scaled >> 8) & 0xFF);
-
-				        // Inserting RH in AppDataBuffer (2 bytes, LSB first)
-				        AppDataBuffer[buffer_index++] = (uint8_t)(hum_scaled & 0xFF);
-				        AppDataBuffer[buffer_index++] = (uint8_t)((hum_scaled >> 8) & 0xFF);
-
-				        len = sprintf(out, "Temp: %.2fC, Hum: %.2f%%RH\r\n", temperature, humidity);
+					if(mode == 0)
+					{
+						len = sprintf(out, "Mode 0 inserted for sensor %d\r\n", sensornum);
 						HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
 
-                        ///////////////////////////////////////////////////////////////////////////////////////////////
-						///////////////////////////////////////////////////////////////////////////////////////////////
-						///////////////////////////////////////////////////////////////////////////////////////////////
-					        // Selezione Canale MUX
-					    	// ch will vary between 0 and 2
-					    	// when ch = 0:
-					    	// ch & 0x01 = 000 & 001 = 000 = FALSE
-					    	// ch & 0x02 = 000 & 010 = 000 = FALSE
-					    	// ch & 0x04 = 000 & 100 = 000 = FALSE
-					    	// when ch = 1:
-					    	// ch & 0x01 = 001 & 001 = 001 = TRUE (because different from 000)
-					    	// ch & 0x02 = 001 & 010 = 000 = FALSE
-					    	// ch & 0x04 = 001 & 100 = 000 = FALSE
-					    	// when ch = 2:
-					    	// ch & 0x01 = 010 & 001 = 000 = FALSE
-					    	// ch & 0x02 = 010 & 010 = 010 = TRUE
-					    	// ch & 0x04 = 010 & 100 = 000 = FALSE
+						// 1) Aspetta lo svuotamento dei buffer fisici ed eco UART prima dello switch del MUX
+						HAL_Delay(50);
 
+						// Avanziamo linearmente il sensore qui, in modo atomico dopo la conferma del K 0
+						if (sensornum == 1){
+							//switch to sensor 2
+					        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_RESET);
 
-							// when ch = 7:
-							// ch & 0x01 = 111 & 001 = 001 = TRUE
-							// ch & 0x02 = 111 & 010 = 010 = TRUE
-							// ch & 0x04 = 111 & 100 = 100 = TRUE
-						// 2. Lettura DS18B20 (Temperatura Suolo)
-						// 1. Attivazione alimentazione sensori
-						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET); // MUXADC_EN ON
-						// --- 1. ACCENSIONE ALIMENTAZIONE ---
-						SENSORS_POWER_ON();
-						HAL_Delay(100); // Tempo di stabilizzazione per tutti i sensori
+							HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
+							HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
+							HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
 
-						// --- 2. LETTURA DEI 3 SENSORI DI TEMPERATURA (Ch 0, 1, 2) ---
-						for (uint8_t ch = 0; ch < 3; ch++) {
-						    Select_Mux_Channel(ch);
-						    HAL_Delay(10);
+					        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
 
-						    // Forza PB2 in modalità Digitale Open Drain per 1-Wire
-						    GPIO_InitTypeDef GPIO_InitStruct = {0};
-						    GPIO_InitStruct.Pin = GPIO_PIN_2;
-						    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-						    GPIO_InitStruct.Pull = GPIO_PULLUP;
-						    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-						    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+							sensornum = 2;
+						}
+						else if (sensornum == 2){
+						 	//switch to sensor 3
+					        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_RESET);
 
-						    int16_t soil_temp = Read_Soil_Temp_Scaled();
+				        	HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
+				        	HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
+				        	HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
 
-						    AppDataBuffer[buffer_index++] = (uint8_t)(soil_temp & 0xFF);
-						    AppDataBuffer[buffer_index++] = (uint8_t)((soil_temp >> 8) & 0xFF);
+					        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
+
+				        	sensornum = 3;
+				        }
+						else if (sensornum == 3){
+						 	//switch to sensor 4
+					        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_RESET);
+
+				        	HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
+				        	HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
+				        	HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+
+					        HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
+
+				        	sensornum = 4;
+				        }
+						else if (sensornum == 4){
+							sensornum = 5; // Fine catena sensori CO2
 						}
 
-						// --- 3. TRANSIZIONE A MODALITÀ ANALOGICA ---
-						GPIO_InitTypeDef GPIO_InitStruct = {0};
-						GPIO_InitStruct.Pin = GPIO_PIN_2;
-						GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-						GPIO_InitStruct.Pull = GPIO_NOPULL;
-						HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-						MX_ADC_Init();
-						HAL_ADCEx_Calibration_Start(&hadc);
-
-						// --- 4. LETTURA DEI 3 SENSORI DI UMIDITÀ (Ch 4, 5, 6) ---
-						for (uint8_t ch = 4; ch < 7; ch++) {
-						    Select_Mux_Channel(ch);
-						    HAL_Delay(20);
-
-						    uint16_t vwc_val = Read_ADC_Value();
-
-						    AppDataBuffer[buffer_index++] = (uint8_t)(vwc_val & 0xFF);
-						    AppDataBuffer[buffer_index++] = (uint8_t)((vwc_val >> 8) & 0xFF);
-						}
-
-						// Spegnimento sensori
-						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET); // MUXADC_EN OFF
-						// --- 5. SPEGNIMENTO ALIMENTAZIONE ---
-						SENSORS_POWER_OFF();
-
-					    ///////////////////////////////////////////////////////////////////////////////////////////////
-					    ///////////////////////////////////////////////////////////////////////////////////////////////
-					    ///////////////////////////////////////////////////////////////////////////////////////////////
-
-						LogToSDCard();
-
-						// Se ho raccolto x medie invio tramite lora (se lora == 1) o tramite UART (se lora == 0)
-				        // Consider that I have 2 bytes per average (with three sensors it means 6 bytes per reading)
-				        // I also have 4 bytes for T + RH, which makes the total increase to 10 bytes
-						// I also have 2 bytes per soil sensor, which means 12 bytes
-						// In total, it comes to 22 bytes of data
-						if (buffer_index >= 68)
+						// Se siamo ancora nell'intervallo dei sensori CO2, svegliamo il successivo
+						if (sensornum <= 4)
 						{
-							if(lora){
-							    AppData.BufferSize = buffer_index;
-							    LmHandlerSetDutyCycleEnable(false);
+						    // 1) Forza l'interruzione di qualsiasi ricezione HAL pendente o incastrata
+						    HAL_UART_AbortReceive(&huart1);
 
-							    //if the appdata buffersize is equal to 10 multiplied by the number of sensors (in total 3)
-							    // it means we acquired 10 bytes for each sensor, which means 5 averages from each
-							    // modifying the 10, allows to set the bytes for each sensor before transmitting via lora
-							    UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_LoRaSendOnTxTimerOrButtonEvent), CFG_SEQ_Prio_0);
-							}
+						    // 2) Dai più tempo al MUX e alla linea elettrica per stabilizzarsi (da 50 a 100ms)
+						    HAL_Delay(100);
 
-							else{
-								printOnUart();
+						    // 3) Pulisci i flag di errore hardware e svuota il registro RDR della periferica
+						    __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
+						    volatile uint32_t tmpreg = huart1.Instance->RDR;
+						    UNUSED(tmpreg);
 
-								UTIL_TIMER_Start(&TxTimer);
-							}
+						    // 4) Svuota completamente il buffer software locale
+						    InS = 0;
+						    memset(RdBuffer, 0, BUFFSIZE);
 
-							// 6) Resetta il buffer di raccolta così possiamo continuare a popolarlo
-							buffer_index = 0;
+						    // 5) Forza lo stato della HAL su READY per sicurezza
+						    huart1.RxState = HAL_UART_STATE_READY;
+
+						    // 6) Riapri l'ascolto ad interrupt. Se fallisce, forza una reinizializzazione della UART
+						    if (HAL_UART_Receive_IT(&huart1, rx_buff, 1) != HAL_OK) {
+						        HAL_UART_DeInit(&huart1);
+						        HAL_UART_Init(&huart1);
+						        HAL_UART_Receive_IT(&huart1, rx_buff, 1);
+						    }
+						    HAL_Delay(100);
+
+						    // 7) Solo ORA che la linea è elettricamente stabile e la HAL è pulita, invia il comando
+						    HAL_UART_Transmit(&huart1, (uint8_t*)("K 2\r\n"), 5, 0xFFFF);
 						}
+				        else
+				        {
 
-						// inversely, if we have finished the acquisition of the averages and not reached the wanted
-						// buffersize, we set Stop2
-						else UTIL_LPM_SetStopMode((1 << CFG_LPM_APPLI_Id), UTIL_LPM_ENABLE);
-			        }
+				        	// Catena di srotolamento letture completata (SHT30, ADC, SD, LoRa...)
+							if (!sht3x_init(&sht30)) {
+								HAL_UART_Transmit(&huart2, (uint8_t*)"SHT3x access fail\r\n", 19, 100);
+							}
+							float temperature, humidity;
+							sht3x_read_temperature_and_humidity(&sht30, &temperature, &humidity);
+
+							int16_t temp_scaled = (int16_t)(temperature * 100);
+							uint16_t hum_scaled = (uint16_t)(humidity * 100);
+
+							AppDataBuffer[buffer_index++] = (uint8_t)(temp_scaled & 0xFF);
+							AppDataBuffer[buffer_index++] = (uint8_t)((temp_scaled >> 8) & 0xFF);
+					        AppDataBuffer[buffer_index++] = (uint8_t)(hum_scaled & 0xFF);
+					        AppDataBuffer[buffer_index++] = (uint8_t)((hum_scaled >> 8) & 0xFF);
+
+					        len = sprintf(out, "Temp: %.2fC, Hum: %.2f%%RH\r\n", temperature, humidity);
+							HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+
+							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET); // MUXADC_EN ON
+							SENSORS_POWER_ON();
+							HAL_Delay(100);
+
+							for (uint8_t ch = 0; ch < 3; ch++) {
+							    Select_Mux_Channel(ch);
+							    HAL_Delay(10);
+
+							    GPIO_InitTypeDef GPIO_InitStruct = {0};
+							    GPIO_InitStruct.Pin = GPIO_PIN_2;
+							    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+							    GPIO_InitStruct.Pull = GPIO_PULLUP;
+							    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+							    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+							    int16_t soil_temp = Read_Soil_Temp_Scaled();
+
+							    AppDataBuffer[buffer_index++] = (uint8_t)(soil_temp & 0xFF);
+							    AppDataBuffer[buffer_index++] = (uint8_t)((soil_temp >> 8) & 0xFF);
+							}
+
+							GPIO_InitTypeDef GPIO_InitStruct = {0};
+							GPIO_InitStruct.Pin = GPIO_PIN_2;
+							GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+							GPIO_InitStruct.Pull = GPIO_NOPULL;
+							HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+							MX_ADC_Init();
+							HAL_ADCEx_Calibration_Start(&hadc);
+
+							for (uint8_t ch = 4; ch < 7; ch++) {
+							    Select_Mux_Channel(ch);
+							    HAL_Delay(20);
+
+							    uint16_t vwc_val = Read_ADC_Value();
+
+							    AppDataBuffer[buffer_index++] = (uint8_t)(vwc_val & 0xFF);
+							    AppDataBuffer[buffer_index++] = (uint8_t)((vwc_val >> 8) & 0xFF);
+							}
+
+							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET); // MUXADC_EN OFF
+							SENSORS_POWER_OFF();
+
+							LogToSDCard();
+
+							if (buffer_index >= 120)
+							{
+								if(lora){
+								    AppData.BufferSize = buffer_index;
+								    LmHandlerSetDutyCycleEnable(false);
+								    UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_LoRaSendOnTxTimerOrButtonEvent), CFG_SEQ_Prio_0);
+								}
+								else{
+									printOnUart();
+									UTIL_TIMER_Start(&TxTimer);
+								}
+								buffer_index = 0;
+							}
+							else{
+								//UTIL_LPM_SetStopMode((1 << CFG_LPM_APPLI_Id), UTIL_LPM_ENABLE);
+								selection = 1;
+								UTIL_TIMER_Start(&ManualTimer);
+								HAL_UART_Receive_IT(&huart2, rx_buff, 1);
+							}
+				        }
+					}
+					else if (mode == 2){
+						len = sprintf(out, "Mode 2 inserted for sensor %d\r\n", sensornum);
+						HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+
+						InS = 0;
+						memset(RdBuffer, 0, BUFFSIZE);
+						HAL_UART_Receive_IT(&huart1, rx_buff, 1);
+
+						// Richiede il dato CO2 al sensore corrente ora attivo in Mode 2
+						HAL_UART_Transmit(&huart1, (uint8_t*)("Z\r\n"), 3, 0xFFFF);
+					}
+					return;
 				}
-				else if (mode == 2){
-					len = sprintf(out, "Mode 2 inserted for sensor %d\r\n", sensornum);
-					HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
-					UTIL_TIMER_Start(&ReadTimer);
+				else
+				{
+					//len = sprintf(out, "Received something wrong\r\n");
+					//HAL_UART_Transmit(&huart2, (uint8_t*)out, len, 100);
+				    HAL_UART_Transmit(&huart1, (uint8_t*)("K 2\r\n"), 5, 0xFFFF);
+
+					return;
 				}
-
-				//InS = 0;
-				return;
-			}
-
-			//  3c) Se arriva qualsiasi altra cosa
-			else
-			{
-				return;
 			}
 		}
-    }
+
 }
 
 void commUsart2(void)
@@ -1191,13 +1269,14 @@ void commUsart2(void)
         // Ensure the MUX is enabled
         HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
 
-        // Increment and wrap around (1 -> 2 -> 3 -> 1)
-        sensornum = (sensornum % 3) + 1;
+        // Increment and wrap around (1 -> 2 -> 3 -> 4 -> 1)
+        sensornum = (sensornum % 4) + 1;
 
         // Apply MUX mapping based on your bitmap:
         // CO2_1: A2=0, A1=0, A0=1
         // CO2_2: A2=0, A1=1, A0=1
         // CO2_3: A2=0, A1=0, A0=0
+        // CO2_3: A2=0, A1=1, A0=0
         if (sensornum == 1) {
             HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
             HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
@@ -1206,10 +1285,15 @@ void commUsart2(void)
             HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
             HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
             HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
-        } else { // sensornum == 3
+        } else if (sensornum == 3) {
             HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
             HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_RESET);
             HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
+        }
+        else {
+        	HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_RESET);
+        	HAL_GPIO_WritePin(GPIOB, MUX_A1_Pin, GPIO_PIN_SET);
+        	HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
         }
 
         len = sprintf(out, "Manual selection: CO2 Sensor %d active\r\n", sensornum);
@@ -1287,6 +1371,12 @@ static void OnReadTimerEvent(void *context)
 	  }
 
 	  //UTIL_TIMER_Start(&ReadTimer);
+}
+
+static void OnManualTimerEvent(void *context)
+{
+	  selection = 2;
+	  UTIL_LPM_SetStopMode((1 << CFG_LPM_APPLI_Id), UTIL_LPM_ENABLE);
 }
 /* USER CODE END PrFD */
 
@@ -1425,12 +1515,13 @@ static void OnTxTimerEvent(void *context)
   /* USER CODE BEGIN OnTxTimerEvent_1 */
 	finished = false;
 	//Enable the MUX
-	HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_RESET);
 
 	//CO2 sensor x      (bitmap A2 A1 A0)
 	//CO2 sensor CO2_1  (bitmap 0  0  1)
 	//CO2 sensor CO2_2  (bitmap 0  1  1)
 	//CO2 sensor CO2_3  (bitmap 0  0  0)
+	//CO2 sensor CO2_3  (bitmap 0  1  0)
 
 
 	HAL_GPIO_WritePin(GPIOA, MUX_A0_Pin, GPIO_PIN_SET);
@@ -1438,6 +1529,9 @@ static void OnTxTimerEvent(void *context)
 	HAL_GPIO_WritePin(GPIOB, MUX_A2_Pin, GPIO_PIN_RESET);
 
 	sensornum = 1;
+
+	HAL_GPIO_WritePin(GPIOA, MUXCO2_EN_Pin, GPIO_PIN_SET);
+
 	  //UTIL_SEQ_ENTER_CRITICAL_SECTION();
 	  if(selection == 2){
 		  UTIL_LPM_SetStopMode((1 << CFG_LPM_APPLI_Id), UTIL_LPM_DISABLE);
@@ -1445,7 +1539,7 @@ static void OnTxTimerEvent(void *context)
 
 		  InS = 0;
 
-		  //HAL_UART_Transmit(&huart2, (uint8_t *)"tim\r\n", 5, 0xFFFF); // arriva senza problemi
+		  HAL_UART_Transmit(&huart2, (uint8_t *)"tim\r\n", 5, 0xFFFF); // arriva senza problemi
 
 		  //if (mode != 2)
 		  //{
@@ -1764,4 +1858,3 @@ static void OnRestoreContextRequest(void *nvm, uint32_t nvm_size)
 
   /* USER CODE END OnRestoreContextRequest_Last */
 }
-
