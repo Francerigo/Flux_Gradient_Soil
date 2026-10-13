@@ -129,48 +129,46 @@ $$
 T_\mathrm{surface} \le T_\mathrm{dew}
 $$
 
+
 ### Dew-Point Calculation
 
 The dew point is calculated from the air temperature and relative humidity measured by the SHT30.
 
-The current implementation is based on the Magnus approximation:
+The current implementation uses the Magnus approximation:
 
-$$
-\gamma(T,RH)
-=
+```math
+\gamma(T,RH) =
 \ln\left(\frac{RH}{100}\right)
 +
 \frac{aT}{b+T}
-$$
+```
 
-with
+with:
 
-$$
+```math
 a = 17.62
-$$
+```
 
-and
+and:
 
-$$
-b = 243.12 ^\circ\mathrm{C}
-$$
+```math
+b = 243.12\ ^\circ\mathrm{C}
+```
 
-followed by:
+The dew-point temperature is then calculated as:
 
-$$
-T_\mathrm{dew}
-=
+```math
+T_{\mathrm{dew}} =
 \frac{b\gamma}{a-\gamma}
-$$
+```
 
 where:
 
-- \(T\) is the chamber air temperature measured by the SHT30;
-- \(RH\) is the chamber relative humidity;
-- \(T_\mathrm{dew}\) is the calculated dew-point temperature.
+- `T` is the chamber air temperature measured by the SHT30, expressed in °C;
+- `RH` is the chamber relative humidity, expressed in %;
+- `T_dew` is the calculated dew-point temperature, expressed in °C.
 
-The soil temperature is **not used to calculate the dew point**. It can instead provide additional information about the thermal boundary conditions surrounding the chamber.
-
+The soil temperature is **not used to calculate the dew point**. Instead, it provides additional information about the thermal boundary conditions surrounding the measurement chamber.
 ---
 
 ## Active Heater Control
